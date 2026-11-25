@@ -60,6 +60,19 @@ const createInventoryLookup = () => {
 };
 
 /**
+ * Discriminator mapping values are references (`#/components/schemas/Cat`, `./cat.json`),
+ * but they are plain strings, not `{ $ref }` objects. Each one is inventoried through a
+ * stand-in `{ $ref }` object so it is collapsed and renamed exactly like a real `$ref`,
+ * then written back to the mapping once the bundle has been remapped.
+ */
+const discriminatorMappingStandIns = new WeakMap<
+  object,
+  { key: string; mapping: Record<string, unknown> }
+>();
+
+const isRefLike = (value: string) => value.includes('#') || value.includes('/');
+
+/**
  * Determine the container type from a JSON Pointer path.
  * Analyzes the path tokens to identify the appropriate OpenAPI component container.
  *
@@ -343,6 +356,35 @@ const crawl = <S extends object = JSONSchema>({
       // Mark this object as visited BEFORE processing its children
       visitedObjects.add(obj);
 
+      const discriminator = (obj as any).discriminator;
+      const mapping =
+        discriminator && typeof discriminator === 'object' ? discriminator.mapping : undefined;
+      if (mapping && typeof mapping === 'object' && !Array.isArray(mapping)) {
+        for (const [value, ref] of Object.entries(mapping)) {
+          if (typeof ref !== 'string' || !isRefLike(ref)) {
+            continue;
+          }
+          const standIn = { $ref: ref };
+          discriminatorMappingStandIns.set(standIn, { key: value, mapping });
+          inventory$Ref({
+            $refKey: null,
+            $refParent: standIn,
+            $refs,
+            indirections,
+            inventory,
+            inventoryLookup,
+            options,
+            path: Pointer.join(Pointer.join(path, 'discriminator'), 'mapping'),
+            pathFromRoot: Pointer.join(
+              Pointer.join(Pointer.join(pathFromRoot, 'discriminator'), 'mapping'),
+              value,
+            ),
+            resolvedRefs,
+            visitedObjects,
+          });
+        }
+      }
+
       // Crawl the object in a specific order that's optimized for bundling.
       // This is important because it determines how `pathFromRoot` gets built,
       // which later determines which keys get dereferenced and which ones get remapped
@@ -582,7 +624,11 @@ function remap(parser: $RefParser, inventory: Array<InventoryEntry>) {
 
     // Avoid changing direct self-references; keep them internal
     if (entry.circular) {
-      if (entry.$ref && typeof entry.$ref === 'object') {
+      if (
+        entry.$ref &&
+        typeof entry.$ref === 'object' &&
+        !discriminatorMappingStandIns.has(entry.parent)
+      ) {
         entry.$ref.$ref = decodeURI(entry.pathFromRoot);
       }
       continue;
@@ -644,10 +690,21 @@ function remap(parser: $RefParser, inventory: Array<InventoryEntry>) {
 
     // Point the occurrence to the internal definition, preserving extensions
     const refPath = `${prefix}/${defName}`;
-    if (entry.extended && entry.$ref && typeof entry.$ref === 'object') {
+    if (
+      (entry.extended && entry.$ref && typeof entry.$ref === 'object') ||
+      discriminatorMappingStandIns.has(entry.parent)
+    ) {
       entry.$ref.$ref = refPath;
     } else {
       entry.parent[entry.key] = { $ref: refPath };
+    }
+  }
+
+  // Write the remapped references back into the discriminator mappings they came from
+  for (const entry of inventory) {
+    const target = discriminatorMappingStandIns.get(entry.parent);
+    if (target && typeof entry.$ref?.$ref === 'string') {
+      target.mapping[target.key] = entry.$ref.$ref;
     }
   }
 }

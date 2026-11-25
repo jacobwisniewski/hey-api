@@ -404,6 +404,8 @@ export class $RefParser {
       return name;
     };
 
+    const isRefLike = (value: string): boolean => value.includes('#') || value.includes('/');
+
     const rewriteRef = (ref: string, refMap: Map<string, string>): string => {
       // OAS3: #/components/{section}/{name}...
       let m = ref.match(/^#\/components\/([^/]+)\/([^/]+)(.*)$/);
@@ -444,21 +446,36 @@ export class $RefParser {
         return obj;
       }
 
+      const rewriteRefValue = (s: string): string => {
+        if (s.startsWith('#')) {
+          return rewriteRef(s, refMap);
+        }
+        // relative external ref -> absolutize against source base path
+        return url.getProtocol(s) === undefined ? url.resolve(basePath + '#', s) : s;
+      };
+
       const out: any = {};
       for (const [k, v] of Object.entries(obj)) {
         if (k === '$ref' && typeof v === 'string') {
-          const s = v as string;
-          if (s.startsWith('#')) {
-            out[k] = rewriteRef(s, refMap);
-          } else {
-            const proto = url.getProtocol(s);
-            if (proto === undefined) {
-              // relative external ref -> absolutize against source base path
-              out[k] = url.resolve(basePath + '#', s);
-            } else {
-              out[k] = s;
-            }
-          }
+          out[k] = rewriteRefValue(v as string);
+        } else if (
+          k === 'discriminator' &&
+          v &&
+          typeof v === 'object' &&
+          (v as any).mapping &&
+          typeof (v as any).mapping === 'object'
+        ) {
+          // Discriminator mapping values are references too, but they are plain strings
+          const { mapping, ...rest } = v as any;
+          out[k] = {
+            ...cloneAndRewrite(rest, refMap, tagMap, opIdPrefix, basePath),
+            mapping: Object.fromEntries(
+              Object.entries(mapping).map(([value, ref]) => [
+                value,
+                typeof ref === 'string' && isRefLike(ref) ? rewriteRefValue(ref) : ref,
+              ]),
+            ),
+          };
         } else if (k === 'tags' && Array.isArray(v) && v.every((x) => typeof x === 'string')) {
           out[k] = v.map((t) => tagMap.get(t) || t);
         } else if (k === 'operationId' && typeof v === 'string') {

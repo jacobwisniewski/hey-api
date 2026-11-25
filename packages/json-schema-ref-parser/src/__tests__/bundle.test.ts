@@ -859,4 +859,115 @@ describe('bundle', () => {
       }
     });
   });
+
+  describe('discriminator mapping', () => {
+    const withTempDir = async (run: (dir: string) => Promise<void>) => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'json-schema-ref-parser-'));
+      try {
+        await run(tempDir);
+      } finally {
+        fs.rmSync(tempDir, { force: true, recursive: true });
+      }
+    };
+
+    const petSpec = (components: Record<string, unknown>) => ({
+      components: { schemas: components },
+      info: { title: 'Test API', version: '1.0.0' },
+      openapi: '3.1.0',
+      paths: {},
+    });
+
+    it('points mapping values at the schema an alias resolves to', async () => {
+      await withTempDir(async (dir) => {
+        const rootPath = path.join(dir, 'root.json');
+        writeJsonFile(
+          rootPath,
+          petSpec({
+            Cat: { properties: { kind: { const: 'cat' } }, type: 'object' },
+            CatAlias: { $ref: '#/components/schemas/Cat' },
+            Dog: { properties: { kind: { const: 'dog' } }, type: 'object' },
+            DogAlias: { $ref: '#/components/schemas/Dog' },
+            Pet: {
+              discriminator: {
+                mapping: {
+                  cat: '#/components/schemas/CatAlias',
+                  dog: '#/components/schemas/DogAlias',
+                },
+                propertyName: 'kind',
+              },
+              oneOf: [
+                { $ref: '#/components/schemas/CatAlias' },
+                { $ref: '#/components/schemas/DogAlias' },
+              ],
+            },
+          }),
+        );
+
+        const schema = (await new $RefParser().bundle({ pathOrUrlOrSchema: rootPath })) as any;
+        const pet = schema.components.schemas.Pet;
+
+        expect(pet.oneOf).toEqual([
+          { $ref: '#/components/schemas/Cat' },
+          { $ref: '#/components/schemas/Dog' },
+        ]);
+        expect(pet.discriminator.mapping).toEqual({
+          cat: '#/components/schemas/Cat',
+          dog: '#/components/schemas/Dog',
+        });
+      });
+    });
+
+    it('keeps mapping values in sync with refs hoisted from external files', async () => {
+      await withTempDir(async (dir) => {
+        writeJsonFile(path.join(dir, 'providers.json'), {
+          Alpha: { properties: { type: { const: 'alpha' } }, type: 'object' },
+          Beta: { properties: { type: { const: 'beta' } }, type: 'object' },
+        });
+        const rootPath = path.join(dir, 'root.json');
+        writeJsonFile(
+          rootPath,
+          petSpec({
+            Provider: {
+              discriminator: {
+                mapping: {
+                  alpha: './providers.json#/Alpha',
+                  beta: './providers.json#/Beta',
+                },
+                propertyName: 'type',
+              },
+              oneOf: [{ $ref: './providers.json#/Alpha' }, { $ref: './providers.json#/Beta' }],
+            },
+          }),
+        );
+
+        const schema = (await new $RefParser().bundle({ pathOrUrlOrSchema: rootPath })) as any;
+        const provider = schema.components.schemas.Provider;
+        const refs = provider.oneOf.map((member: { $ref: string }) => member.$ref);
+
+        expect(refs).toEqual(['#/components/schemas/Alpha', '#/components/schemas/Beta']);
+        expect(Object.values(provider.discriminator.mapping)).toEqual(refs);
+        expect(schema.components.schemas.Alpha).toBeDefined();
+      });
+    });
+
+    it('leaves mapping values that are not references untouched', async () => {
+      await withTempDir(async (dir) => {
+        const rootPath = path.join(dir, 'root.json');
+        writeJsonFile(
+          rootPath,
+          petSpec({
+            Cat: { type: 'object' },
+            Pet: {
+              discriminator: { mapping: { cat: 'Cat' }, propertyName: 'kind' },
+              oneOf: [{ $ref: '#/components/schemas/Cat' }],
+            },
+          }),
+        );
+
+        const schema = (await new $RefParser().bundle({ pathOrUrlOrSchema: rootPath })) as any;
+
+        expect(schema.components.schemas.Pet.discriminator.mapping).toEqual({ cat: 'Cat' });
+      });
+    });
+  });
 });
